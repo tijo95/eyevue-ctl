@@ -1,0 +1,29 @@
+# build
+eyevue-ctl/app/build/
+eyevue-ctl/build/
+eyevue-ctl/.gradle/
+eyevue-ctl/local.properties
+*.log
+
+# binaires : ne pas versionner (le build se fait sur place)
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# captures de trames = donnees locales (peuvent contenir des noms de fichiers perso)
+protocol/captures/
+*.logcat
+
+# python
+__pycache__/
+*.pyc
+
+# notes privees (IP du reseau local, serial de la machine, noms de builds)
+private_notes/
+
+# IDE
+.idea/
+*.iml
+.gradle/
+.DS_Store

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- API 31+ -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+    <!-- API <= 30 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <!-- maxSdkVersion 29 : le scan WiFi n'exige la position que jusqu'a Android 10 ;
+         au-dela c'est NEARBY_WIFI_DEVICES (declaree plus bas) qui fait le travail,
+         et une localisation demandee en trop ferait apparaitre une permission
+         "inutile" a l'installation. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="29" />
+
+    <!-- Import par WiFi : LE BLOC REPRIS DU MANIFESTE DU CONSTRUCTEUR (versionName
+         1.0.82-gp, AndroidManifest.xml de l'APK decode dans work/apktool_out).
+         INTERNET y est declare ; sans lui netd refuse la creation du socket et
+         le log sort en "socket failed: EPERM (Operation not permitted)", mesure
+         du 11-12 13:04:19 sur les 6 tentatives de sonde. C'est la permission qui
+         autorise a ouvrir un socket ; ACCESS_NETWORK_STATE ne fait que lire
+         l'etat du reseau. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- OBLIGATOIRE pour requestNetwork() + WifiNetworkSpecifier : sans elle,
+         SecurityException immediate ("com.local.eyevuectl was not granted either
+         of these permissions: CHANGE_NETWORK_STATE, WRITE_SETTINGS", log du
+         11-12 01:22:40.298, WifiImport.kt:200). Permission "normal" : accordee a
+         l'installation, sans dialogue. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- API 33+ : le scan WiFi est compte comme "appareils a proximite". -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <!-- ACCESS_FINE_LOCATION est deja declaree plus haut (maxSdkVersion 30) : elle
+         couvre le scan WiFi des API <= 28, pas besoin de la redemander. -->
+    <!-- Ecrire les fichiers imports dans la galerie. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <uses-feature android:name="android.hardware.wifi" android:required="true" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <!-- Cleartext (HTTP en clair) AUTORISE, recopie du manifeste du constructeur
+         (versionName 1.0.82-gp) : il declare usesCleartextTraffic="true" ET un
+         network_security_config avec cleartextTrafficPermitted="true".
+         Sans cela le listing est refuse par la politique par defaut (targetSdk>=28),
+         mesuree sur le telephone : "Cleartext HTTP traffic to 192.168.169.1 not
+         permitted" x3 URL a 13:18:24, apres que la sonde TCP est passee ok.
+         L'AP des lunettes ne sert que du HTTP sur 192.168.169.1, jamais de HTTPS. -->
+    <application
+        android:label="EyevueCtl"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/AppTheme">
+        <activity
+            android:name=".AlbumActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+        <!-- Visualiseur lance par AlbumActivity via Intent interne : exported=false
+             suffit (le shell ne peut pas le demarrer, verifie au 12-11 16:04 :
+             "Permission Denial: ... not exported from uid"). -->
+        <activity
+            android:name=".ViewerActivity"
+            android:exported="false" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

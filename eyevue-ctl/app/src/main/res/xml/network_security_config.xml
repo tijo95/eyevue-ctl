@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Recopie a l'identique du res/xml/network_security_config.xml du constructeur
+     (APK 1.0.82-gp, decode dans work/apktool_out) : leur seule directive est
+     cleartextTrafficPermitted="true" en base-config. L'AP des lunettes ne sert
+     que du HTTP en clair sur 192.168.169.1. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
