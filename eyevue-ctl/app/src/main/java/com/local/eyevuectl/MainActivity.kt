@@ -22,11 +22,15 @@ import android.view.Gravity
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
+import android.os.Handler
+import android.os.Looper
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -53,6 +57,14 @@ class MainActivity : Activity() {
     private lateinit var eyevue: Eyevue
     private val state = GlassState()
     private var adapter: BluetoothAdapter? = null
+
+    // ---- traduction du texte vu par les lunettes (camera des lunettes, PAS
+    //          celle du telephone : la source est 0x22 + l'AP, voir Translate.kt)
+    private val main = Handler(Looper.getMainLooper())
+    private var tts: Tts? = null
+    private var translate: Translate? = null
+    /** Langue choisie dans le dialogue ; celle du telephone tant que rien n'est choisi. */
+    private var langTag: String = Locale.getDefault().language
 
     private lateinit var deviceLabel: TextView
     private lateinit var dot: View
@@ -92,6 +104,10 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         try { unregisterReceiver(rxScan) } catch (_: Exception) {}
         BleCtlShared.get(this).listeners.remove(sharedListener)
+        translate?.let { BleCtlShared.get(this).listeners.remove(it.bleListener) }
+        // shutdown() ferme le proxy A2DP et le service TTS : sans lui le telephone
+        // garde une prise A2DP ouverte, ce qui gene l'audio des autres apps.
+        tts?.shutdown()
         super.onDestroy()
     }
 
@@ -214,8 +230,15 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ journal / etat
 
     private fun log(s: String) {
-        logView.append("${stamp()}  $s\n")
+        // logView est une VUE : y toucher depuis un fil secondaire est interdit
+        // (CalledFromThreadWrong). Le fil de la traduction (association AP,
+        // modele vision, synthese) est justement un fil secondaire : le log est
+        // donc poster systematiquement, ce qui est sans effet quand l'appel vient
+        // deja du fil UI.
+        val line = "${stamp()}  $s\n"
         android.util.Log.i("EyevueCtl", s)
+        if (Looper.myLooper() == Looper.getMainLooper()) logView.append(line)
+        else main.post { logView.append(line) }
     }
 
     private fun refreshStatus() {
@@ -400,6 +423,17 @@ class MainActivity : Activity() {
         album.layoutParams = al
         box.addView(album)
 
+        // --- carte Traduire le texte. UN APPUI, pas de dialogue a chaque fois :
+        //     declencher la prise de vue (BLE 0x22 en haute qualite), aller
+        //     chercher la pleine resolution par l'AP, la traduire, la lire. Les
+        //     reglages (serveur, langue, voix) sont depliables plus bas.
+        val tr = actionCard("Traduire le texte", "\ud83d\udd24", 1f) { startTranslate() }
+        val tl = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        tl.topMargin = dp(10f)
+        tr.layoutParams = tl
+        box.addView(tr)
+
         // --- carte volume
         val vol = actionCard("R\u00e9glage du volume", "\ud83d\udd0a", 1f) { showVolume() }
         val vl = LinearLayout.LayoutParams(
@@ -417,6 +451,10 @@ class MainActivity : Activity() {
         moreBox.orientation = LinearLayout.VERTICAL
         moreBox.visibility = View.GONE
         box.addView(moreBox)
+
+        addSection(moreBox, "traduction du texte",
+            "Reglages serveur IA + voix" to { showTranslateSettings() },
+            "Arreter la lecture" to { translate?.stopSpeaking() })
         more.setOnClickListener {
             moreBox.visibility = if (moreBox.visibility == View.GONE) View.VISIBLE else View.GONE
             more.text = if (moreBox.visibility == View.VISIBLE)
@@ -560,6 +598,180 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------ dialogues
+
+    // ------------------------------------------------------------------ traduction
+
+    /** Ecoute Wi-Fi de la chaine de traduction (phases de la capture photo). */
+    private val translateWifiListener = object : WifiImport.Listener {
+        override fun onPhase(phase: String, detail: String) = log("$phase : $detail")
+        override fun onProgress(done: Int, total: Int, filePct: Int) {
+            if (filePct >= 0) log("AP : telechargement ${filePct}%")
+        }
+        override fun onFileDone(f: MediaFile) = log("photo recuperee : ${f.name}")
+        override fun onFinished(okCount: Int, failed: List<String>) {}
+        override fun onLog(s: String) = log(s)
+    }
+
+    private fun prefs() = getSharedPreferences("eyevue", MODE_PRIVATE)
+
+    /**
+     * Tts et Translate sont crees UNE fois : TextToSpeech lie un service du
+     * systeme, le recreer a chaque appui ferait fuiter la liaison, et l'ecoute
+     * BLE (0x42) s'empilerait dans BleCtlShared.listeners.
+     */
+    private fun ensureTranslate(): Translate {
+        translate?.let { return it }
+        val shared = BleCtlShared.get(this)
+        val t = Tts(this)
+        tts = t
+        val w = WifiImport(this, prefs(), translateWifiListener)
+        val tr = Translate(this, prefs(), shared, w, t, { log(it) })
+        translate = tr
+        shared.listeners.add(tr.bleListener)
+        t.init(object : Tts.Listener {
+            override fun onLog(s: String) = log(s)
+            override fun onReady(available: Boolean, why: String) {
+                log(if (available) "synthese vocale prete" else "synthese vocale indisponible : $why")
+            }
+            override fun onSpeaking(speaking: Boolean) {
+                log(if (speaking) "lecture en cours…" else "lecture terminee")
+            }
+        })
+        return tr
+    }
+
+    /**
+     * Le bouton. Il ne demande rien a l'ecran : la langue est celle deja choisie.
+     * Si le serveur n'est pas configure, il ouvre les reglages au lieu d'echouer
+     * avec une erreur qui ne dit pas ce qui manque.
+     */
+    private fun startTranslate() {
+        val tr = ensureTranslate()
+        val p = prefs()
+        val url = p.getString(Vision.PREF_URL, "") ?: ""
+        val model = p.getString(Vision.PREF_MODEL, "") ?: ""
+        if (url.isBlank() || model.isBlank()) {
+            log("serveur IA incomplet (URL " + (if (url.isBlank()) "vide" else "renseignee") +
+                ", modele " + (if (model.isBlank()) "vide" else "renseigne") + ") : reglages ouverts")
+            showTranslateSettings()
+            return
+        }
+        log("traduction lancee — langue « $langTag » ; ${tr.whereVoiceGoes()}")
+        tr.captureTranslateSpeak(langTag)
+    }
+
+    /**
+     * Reglages : langue, serveur, voix. L'etat de la synthese vocale est AFFICHE
+     * avec ses codes reels : un echec de TextToSpeech est muet (onInit renvoie un
+     * code, ne leve aucune exception), donc sans cet etat a l'ecran un bouton qui
+     * ne dit rien reste incomprehensible.
+     */
+    private fun showTranslateSettings() {
+        val tr = ensureTranslate()
+        val p = prefs()
+        val sc = ScrollView(this)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16f), dp(8f), dp(16f), dp(8f))
+
+        // --- langue : sert a la traduction ET a la voix. Les deux sont distinctes
+        //     dans le moteur (un modele traduit dans presque toute langue ; un TTS
+        //     n'a que les voix installees), d'ou le status affiche au changement.
+        val lt = txt(13f, 0xFF9A9AA0.toInt())
+        lt.text = "LANGUE DE TRADUCTION (aussi celle que la voix lira)"
+        lt.setPadding(dp(4f), dp(10f), dp(4f), dp(4f))
+        box.addView(lt)
+        val sp = Spinner(this)
+        val labels = Tts.LANGS.map { it.first }
+        sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
+        val at = Tts.LANGS.indexOfFirst { it.third.equals(langTag, ignoreCase = true) }
+        if (at >= 0) sp.setSelection(at)
+        sp.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?,
+                                        pos: Int, id: Long) {
+                langTag = Tts.LANGS[pos].third
+                p.edit().putString(Vision.PREF_LANG, langTag).apply()
+                log("langue « ${Tts.LANGS[pos].first} » (tag $langTag) — voix : " +
+                    (tts?.voiceStatus(Tts.LANGS[pos].second) ?: "moteur non init"))
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        box.addView(sp)
+
+        val loc = Tts.langByTag(langTag)?.second ?: Locale.getDefault()
+        val vt = txt(13f)
+        vt.setPadding(0, dp(12f), 0, 0)
+        vt.text = "SYNTHESE VOCALE : " + (if (tr.ttsReady) "MOTEUR PRET" else "MOTEUR NON PRET") +
+            "\n  " + (tts?.initError?.takeIf { it.isNotEmpty() } ?: "aucune erreur d'init") +
+            "\n  voix « $langTag » : " + (tts?.voiceStatus(loc) ?: "moteur non init") +
+            "\n  " + tr.whereVoiceGoes() +
+            "\n\nUn moteur installe mais JAMAIS SELECTIONNE (tts_default_synth = null) " +
+            "donne un bouton muet : le regler ici mene, ou dans Systeme > Langue et " +
+            "saisie > Sortie de la synthese vocale."
+        box.addView(vt)
+        addSection(box, "voix",
+            "Reglages TTS" to { tr.openTtsSettings() },
+            "Installer les voix" to { tr.openVoiceInstall() },
+            "Arreter la lecture" to { tr.stopSpeaking() })
+
+        // --- serveur. L'URL n'est JAMAIS codee en dur : ce depot est public, une
+        //     IP locale ne doit pas s'y trouver. Elle est saisie, normalisee, stockee.
+        val lt2 = txt(13f, 0xFF9A9AA0.toInt())
+        lt2.text = "SERVEUR IA LOCAL (llama.cpp, base /v1)"
+        lt2.setPadding(dp(4f), dp(14f), dp(4f), dp(4f))
+        box.addView(lt2)
+        val urlEdit = EditText(this); urlEdit.hint = "http://ADRESSE:8080"; urlEdit.textSize = 13f
+        urlEdit.setText(p.getString(Vision.PREF_URL, ""))
+        val modelEdit = EditText(this); modelEdit.hint = "nom du modele (voir Lister)"; modelEdit.textSize = 13f
+        modelEdit.setText(p.getString(Vision.PREF_MODEL, ""))
+        val keyEdit = EditText(this); keyEdit.hint = "cle API (vide si le serveur n'en exige pas)"; keyEdit.textSize = 13f
+        keyEdit.setText(p.getString(Vision.PREF_KEY, ""))
+        val promptEdit = EditText(this); promptEdit.textSize = 12f
+        promptEdit.setText(p.getString(Vision.PREF_PROMPT, "")
+            ?.takeIf { it.isNotBlank() } ?: Vision.DEFAULT_PROMPT)
+        for (e in listOf(urlEdit, modelEdit, keyEdit, promptEdit)) {
+            e.setTextColor(Color.WHITE); e.setPadding(0, dp(6f), 0, dp(6f)); box.addView(e)
+        }
+        val speakCb = CheckBox(this)
+        speakCb.text = "lire la traduction a voix haute"
+        speakCb.setTextColor(Color.WHITE)
+        speakCb.isChecked = p.getBoolean(Vision.PREF_AUTO, true)
+        box.addView(speakCb)
+
+        val save = Button(this); save.text = "Enregistrer"; save.isAllCaps = false
+        save.setOnClickListener {
+            p.edit()
+                .putString(Vision.PREF_URL, Vision.normalizeBase(urlEdit.text.toString()))
+                .putString(Vision.PREF_MODEL, modelEdit.text.toString().trim())
+                .putString(Vision.PREF_KEY, keyEdit.text.toString().trim())
+                .putString(Vision.PREF_PROMPT, promptEdit.text.toString())
+                .putBoolean(Vision.PREF_AUTO, speakCb.isChecked)
+                .apply()
+            log("reglages IA enregistres — URL normalisee : " + (p.getString(Vision.PREF_URL, "") ?: "") +
+                " ; ne collez pas /v1, le client l'ajoute lui-meme")
+        }
+        box.addView(save)
+        val probe = Button(this); probe.text = "Sonder le serveur (/health)"; probe.isAllCaps = false
+        probe.setOnClickListener { tr.probeServer() }
+        box.addView(probe)
+        val models = Button(this); models.text = "Lister les modeles charges"; models.isAllCaps = false
+        models.setOnClickListener {
+            log("lecture de /v1/models…")
+            tr.listModels { list ->
+                if (list.isEmpty()) { log("aucun modele liste : serveur injoignable ?"); return@listModels }
+                val arr = list.toTypedArray()
+                AlertDialog.Builder(this).setTitle("Modeles charges")
+                    .setItems(arr) { _, i ->
+                        modelEdit.setText(arr[i]); log("modele choisi : ${arr[i]}") }
+                    .show()
+            }
+        }
+        box.addView(models)
+
+        sc.addView(box)
+        AlertDialog.Builder(this).setTitle("Traduire le texte — reglages")
+            .setView(sc).setNegativeButton("Fermer", null).create().show()
+    }
 
     private fun showVolume() {
         val cells = listOf(

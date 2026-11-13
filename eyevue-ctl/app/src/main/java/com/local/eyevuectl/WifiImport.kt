@@ -763,4 +763,122 @@ class WifiImport(
             main.post { listener.onLog("panneau WiFi indisponible : ${e.message}") }
         }
     }
+
+    // ==========================================================================
+    // TRADUCTION : recuperer la PHOTO PLEINE RESOLUTION, pas la vignette BLE.
+    //
+    // Pourquoi passer par l'AP alors que le BLE sait declencher la prise de vue :
+    // la vignette que le BLE rend (trame 0x45/0x42, PTakePhoto.Thumbnail=0x30)
+    // fait 720x300 pour ~5,7 ko. Les pleines resolutions mesurees sur ce depot
+    // font 1 280x960 a 3 200x2 400 pour 129 ko a 379 ko, soit 53 fois plus de
+    // pixels. Un texte de 50 caracteres sur une page A4 tient dans ~300 pixels de
+    // large : sur la vignette il est sous-echantillone, aucun OCR ne le sort.
+    // Le BLE declenche (0x22, PTakePhoto.HighQuality=0x31) ; l'AP rend le fichier.
+    //
+    // Choix de la photo : le listing de l'AP n'est PAS trie, et MediaFile.keyOf
+    // donne une IDENTITE (les 17 chiffres), pas un ordre. Le seul critere sur
+    // lequel s'appuyer est epochSec, et il est compare a l'instant LOCAL du
+    // declenchement : les fichiers deja presentes sur les lunettes sont donc
+    // ecartees par construction, pas par hypothese.
+    // ==========================================================================
+
+    sealed class Snap {
+        class Ok(val uri: android.net.Uri, val bytes: ByteArray, val f: MediaFile) : Snap()
+        class Err(val why: String) : Snap()
+    }
+
+    /**
+     * Prend la photo pleine resolution la plus recente, l'amene dans la galerie,
+     * rend ses octets. Appeler sur fil secondaire : bloquant (association AP =
+     * ~20 s, dont la fenetre systeme que l'utilisateur doit toucher).
+     *
+     * @param triggerEpochSec heure LOCALE du declenchement, en SECONDES (la
+     *   conversion epochSec <-> millisecondes est explicite ici : epochSec est en
+     *   secondes, voir Fabricants.kt, epochMs = epochSec*1000).
+     */
+    fun captureLatestPhoto(triggerEpochSec: Long, done: (Snap) -> Unit) {
+        cancelled = false
+        connThread = Thread {
+            val r = try { captureSequence(triggerEpochSec) }
+                catch (t: Throwable) { Snap.Err(t.message ?: t.javaClass.simpleName) }
+            main.post { done(r) }
+        }
+        connThread?.start()
+    }
+
+    private fun captureSequence(trigger: Long): Snap {
+        main.post { listener.onPhase("connexion", "ouverture de l'AP des lunettes\u2026") }
+        val ssid = acquireAp() ?: return Snap.Err(
+            "AP des lunettes non jointe. Sans l'AP il n'y a PAS de pleine resolution : " +
+                "la vignette BLE (720x300) ne rend pas du texte lisible, la traduction " +
+                "est impossible par ce chemin")
+        listener.onLog("AP « $ssid » associee")
+        // release() est OBLIGATOIRE en finally : acquireAp() a appele
+        // bindProcessToNetwork(network). Tant que ce lien tient, TOUT le trafic
+        // HTTP de l'app sort par l'AP des lunettes, qui ne donne pas acces au
+        // reseau local. Le serveur IA est sur le reseau local : sans release(),
+        // la requete de traduction part dans l'AP et echoue, avec un message
+        // d'erreur qui ne dit rien de la vraie cause.
+        try {
+            val files = fetchList() ?: return Snap.Err(
+                "listing de l'AP indisponible : aucune des 2 bases n'a repondu " +
+                    "(10 tentatives, 2,4 s). Le serveur embarque ne repond qu'aux " +
+                    "query du constructeur, jamais a la racine nue")
+            if (files.isEmpty()) return Snap.Err("listing vide : aucune photo sur les lunettes")
+
+            // Fraiches = parties APRÈS le declenchement. C'est ce filtre qui
+            // ecarte les photos deja presentes, et il ne fonctionne que si
+            // l'epoch du listing est comparable a l'heure du telephone : c'est
+            // pour cela que l'app envoie TIME (0x16) a la connexion (Fabrice).
+            val fresh = files.filter { it.epochSec != null && it.epochSec >= trigger }
+            val pool = if (fresh.isNotEmpty()) fresh
+            // Repli honnete : si AUCUN fichier n'est marque posterieur, le
+            // declenchement n'a pas cree de fichier (modele qui ne prend pas en
+            // charge la prise de vue a distance, ou epoch du listing caler sur
+            // une autre horloge que celle du telephone). On ne choisit alors pas
+            // une photo au hasard sans le dire : on prend les 3 plus recentes et
+            // la suite affiche qu'elle vient du listing, pas de la commande.
+            else files.filter { it.epochSec != null }
+                .sortedBy { it.epochSec }.takeLast(3)
+                .also { listener.onLog("aucun fichier marque posterieur au declenchement : " +
+                    "l'epoch du listing est sans doute cale sur une autre horloge que " +
+                    "celle du telephone (0x16) ; repli sur les 3 plus recentes") }
+
+            val newest = pool.filter { it.tab == MediaFile.TAB_PHOTO }
+                .maxByOrNull { it.epochSec!! }
+                ?: return Snap.Err(
+                    "aucune IMAGE dans le listing de l'AP (${files.size} entrees) : la " +
+                    "commande de prise de vue n'a produit aucun fichier. Verifier que le " +
+                    "modele accepte la prise de vue a distance (capacites 0x95)")
+
+            listener.onLog("photo retenue : ${newest.name}, ${newest.size} octets, " +
+                "epoch ${newest.epochSec} (" +
+                (if (fresh.isNotEmpty()) "declenchee par la commande" else "PLUS RECENTE DU LISTING, pas la capture") + ")")
+
+            main.post { listener.onPhase("importation", "1/1") }
+            // download() publie dans la galerie (publish -> MediaStore) et supprime
+            // le temp : le fichier est donc rendu par son Uri, pas par un chemin.
+            // C'est ce qui evite de lire un temp en cours d'ecriture.
+            when (val d = download(newest, 1, 1)) {
+                is Down.Ok -> {
+                    val bytes = ctx.contentResolver.openInputStream(d.uri)
+                        ?.use { it.readBytes() }
+                        ?: return Snap.Err("fichier importe mais MediaStore le rend illisible")
+                    // Garde-fou : une vignette fait ~5,7 ko. Un fichier de cette
+                    // taille veut dire que l'AP n'a sert que la vignette, auquel cas
+                    // la traduction echouerait sans que le motif soit visible.
+                    if (bytes.size < 20_000) return Snap.Err(
+                        "${bytes.size} octets seulement : ce fichier est une vignette, pas " +
+                            "la pleine resolution. La traduction de texte est inutilisable " +
+                            "sur une vignette (720x300)")
+                    listener.onLog("${bytes.size} octets lus depuis la galerie")
+                    return Snap.Ok(d.uri, bytes, newest)
+                }
+                is Down.Err -> return Snap.Err("telechargement depuis l'AP impossible : " + d.why)
+            }
+        } finally {
+            release()
+            listener.onLog("AP relachee (bindProcessToNetwork annule) : acces reseau local rendu")
+        }
+    }
 }

@@ -1,0 +1,12 @@
+# Fichiers LOCAUX : ne jamais pousser dans un depot public.
+# local.properties porte le chemin du SDK de CETTE machine.
+local.properties
+
+# Sorties de build et caches
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+.idea/
+*.iml

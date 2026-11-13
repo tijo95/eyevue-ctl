@@ -43,6 +43,34 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- VISIBILITE DES APPLICATIONS (Android 11+ ; targetSdk=34).
+         Sans ce bloc, TextToSpeech NE S'INITIALISE PAS, et l'echec est muet
+         (onInit renvoie un code d'erreur, aucune exception). Un service de
+         synthese vocale appartient a une AUTRE application ; depuis Android 11
+         une app ciblee 30+ ne voit pas les applications des autres, donc la
+         liaison vers le moteur est invisible.
+
+         Les deux formes sont declarees volontairement :
+           - <intent> (action TTS) : couvre n'importe quel moteur, y compris
+             celui d'un fabricant (Samsung, Xiaomi). C'est la forme portable.
+           - <package> com.google.android.tts : le moteur present sur CE
+             telephone, mesure par "pm list packages | grep tts" (une seule
+             reponse). Il est declare en plus de l'intent, pas a sa place.
+         Le nom du moteur n'est donc PAS suppose : l'intent est portable, le
+         package nomme ce qui est mesure, et le diagnostic affiche celui qui
+         est selectionne. Le telephone porte la valeur
+         secure/tts_default_synth = null (moteur installe, jamais selectionne)
+         : cela se regle dans les reglages systeme, pas dans le code.
+
+         Le bloc est place AVANT <application> : la visibilite est une
+         propriete du paquet, pas de l'activite. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <package android:name="com.google.android.tts" />
+    </queries>
+
     <uses-feature android:name="android.hardware.wifi" android:required="true" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
