@@ -74,15 +74,30 @@ class Translate(
     /** Compteur 0x42 lu par la derniere demande (voir le commentaire de classe). */
     @Volatile private var count42 = -1
     @Volatile private var frame42: CountDownLatch? = null
-    /** Etat BLE, suivi ici et non lu ailleurs : BleCtl n'expose PAS d'isConnected(). */
-    @Volatile private var bleConnected = false
+    /** État BLE suivi par ÉVÉNEMENTS, utile pour les transitions seulement. Le
+     *  point de départ d'une chaîne ne vient JAMAIS de là : voir linkState() de
+     *  BleCtl, qui interroge le système. Un listener ajouté après la connexion ne
+     *  reçoit jamais CONNECTED (les événements ne partent qu'au changement), ce
+     *  qui rendait le bouton de traduction muet. */
+    @Volatile private var bleEventConnected = false
 
     /** A brancher sur BleCtlShared.listeners au onCreate, retire au onDestroy. */
     val bleListener = object : BleCtlShared.Listener {
         override fun onState(state: BleCtl.State, detail: String) {
-            bleConnected = (state == BleCtl.State.CONNECTED)
+            bleEventConnected = (state == BleCtl.State.CONNECTED)
         }
         override fun onFrame(rx: Frame.Rx) {
+            // 0x25 APP_RECEIVE_WIFI_INFO : le SSID reel de l'AP, en ASCII. Decodé
+            // ici comme dans AlbumActivity (trim('\u0000') : le payload est bourré de
+            // zeros, et un String qui les garde ne correspond a rien en comparaison
+            // d'un SSID). Sert a l'association directe, sans scan systeme.
+            if (rx.cmd == Cmd.APP_RECEIVE_WIFI_INFO) {
+                val s = String(rx.payload, Charsets.ISO_8859_1).trim('\u0000').trim()
+                if (s.isNotEmpty()) {
+                    wifiImport.bleSsid = s
+                    log("SSID de l'AP recu par 0x25 : « $s »")
+                }
+            }
             if (rx.cmd == Cmd.APP_RECEIVE_THUMBNAIL_COUNT) {
                 val n = if (rx.payload.size >= 2)
                     ((rx.payload[0].toInt() and 0xFF) shl 8) or (rx.payload[1].toInt() and 0xFF)
@@ -139,7 +154,26 @@ class Translate(
         val lang = Tts.langByTag(langTag)
             ?: return "langue « $langTag » absente de la liste (Reglages > Langue)"
 
-        if (!bleConnected) return "lunettes deconnectees : rien a declencher"
+        // L'état est interrogé AU CLIC, auprès du système. Il ne vient pas du
+        // drapeau d'événements : ce drapeau ne peut pas connaître un état qui
+        // existe depuis avant la création de ce listener.
+        val (linked, how) = shared.ble.linkState()
+        log("liaison BLE au déclenchement : " +
+            (if (linked) "établie" else "pas établie") + " — source : $how ; " +
+            "dernière trame d'état reçue par cette instance : " +
+            (if (bleEventConnected) "CONNECTED" else "aucune"))
+        if (!linked) return "lunettes déconnectées : rien à déclencher"
+
+        // L'horloge des lunettes estcalee sur celle du telephone AVANT de noter
+        // l'heure du declenchement. Le filtre du listing (epochSec >= heure du
+        // telephone) ne vaut que si les deux horloges sont comparables, et 0x59
+        // (TIME) n'etait JAMAIS envoye en automate : compte mesure sur logcat = 0
+        // trame 0x59, la fonction n'etait appelee que par le bouton « Sync horloge ».
+        // Mesure du 11-13 : le declenchement n'a rien produit et le listing n'a rien
+        // de posterieur au declenchement, sans qu'on puisse separer les deux causes.
+        shared.eyevue.syncTime()
+        log("horloge des lunettes calee sur celle du telephone (0x59) : le filtre par " +
+            "date du listing peut jouer")
 
         // --- etape 2 : le compteur AVANT. C'est lui qui dit si la prise de vue a
         // produit un fichier. Sans ce point de depart, le "nouveau" fichier ne
@@ -168,16 +202,25 @@ class Translate(
         // d'avoir telecharge ferait attendre 25 s pour rien. Les 15 s viennent de la
         // mesure de la prise de vue -> apparition dans le listing, pas d'un reglage.
         if (gotBefore) {
+            // 0x42 n'est PAS une notification : c'est la REPONSE a une demande. Elle
+            // n'arrive que quand on la demande. L'attente qui ne demandait rien ne
+            // pouvait que tourner jusqu'a son timeout sur une valeur jamais
+            // rafraichie : mesure du 11-13, le compteur est reste a 5 pendant toute
+            // l'attente, et le seul 0x42 paru apres la prise de vue est arrive quand
+            // la chaine, elle, etait sortie. Le pull est donc REEMIS a chaque tour.
             var waited = 0
-            while (count42 <= before && waited < 30) {
+            while (count42 <= before && waited < 40) {
                 Thread.sleep(500); waited++
+                shared.eyevue.pullThumbnailCount()
             }
             log(if (count42 > before)
                 "le compteur est passe de $before a $count42 : la photo est sur l'AP"
             else
-                "compteur toujours a $count42 apres 15 s : la prise de vue n'a peut-etre " +
-                    "rien produit (le modele accepte-t-il la prise de vue a distance, " +
-                    "capacites 0x95 ?)")
+                "compteur toujours a $count42 apres " + (waited / 2) + " s, avec " + waited +
+                    " relances de 0x40 : la prise de vue n'a rien produit sur l'AP. " +
+                    "Causes separables : le modele accepte-t-il la prise de vue a " +
+                    "distance (capacites 0x95), et 0x42 compte-t-il les photos en " +
+                    "haute qualite ou seulement les vignettes ?")
         } else {
             Thread.sleep(15_000)
         }
@@ -187,11 +230,28 @@ class Translate(
         // la vraie cause. L'appel est SYNCHRONE (il bloquerait l'ecran sur le
         // thread UI ; ici nous sommes deja sur un fil secondaire, ce qui est le
         // cas voulu).
+        // 0x39 OPEN_WIFI payload [01] : c'est LUI qui allume l'AP des lunettes, et
+        // l'AP est ce qui rend la pleine resolution. Il etait JAMAIS envoye par cette
+        // chaine : compte mesure sur logcat = 0 trame 0x39 ; openWifiAp() n'etait
+        // appele que par AlbumActivity (ligne 228). Le libelle « ouverture de l'AP
+        // des lunettes… » que rendait captureSequence etait une etiquette d'interface,
+        // pas une commande : le telephone partait scanner un reseau qui n'emettait
+        // pas. Mesure du 11-13 : « scan startScan=false, 0 resultats, SSID vus: » et
+        // le scan SYSTEME lui-meme (cmd wifi start-scan, hors de l'app) ne rend
+        // aucun reseau DH-* : 8 reseaux vus, aucun des lunettes. L'AP etait eteinte.
+        // Meme sequence que l'Album : 0x39 d'abord, la suite Wi-Fi ensuite.
+        shared.eyevue.openWifiAp()
+        log("ouverture de l'AP demandee aux lunettes (0x39 payload [01], le seul " +
+            "payload observe sur cette paire)")
+
         val latch = CountDownLatch(1)
         var snap: WifiImport.Snap? = null
         wifiImport.captureLatestPhoto(triggerSec) { r -> snap = r; latch.countDown() }
-        // 90 s : 15 s de fenetre systeme d'association vue a l'ecran, plus le
-        // telechargement. Un delai plus court annulerait des chained legitimes.
+        // 90 s : la fenetre systeme d'association que l'utilisateur doit toucher met
+        // ~16 s a paraitre (mesure : requestNetwork 01:38:20.853, panneau 01:38:36.457),
+        // plus le scan d'ouverture d'AP, plus le telechargement. Un delai plus court
+        // annulerait des chained legitimes : la fin de la fenetre d'association doit
+        // rester comprise dans cette attente.
         latch.await(90, TimeUnit.SECONDS)
         val s: WifiImport.Snap? = snap
         if (s == null) return "attente de la photo interrompue : la fenetre " +

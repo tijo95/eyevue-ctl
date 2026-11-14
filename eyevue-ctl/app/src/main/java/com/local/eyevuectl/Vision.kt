@@ -2,6 +2,10 @@ package com.local.eyevuectl
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.util.Base64
 import android.util.Log
 import org.json.JSONArray
@@ -113,13 +117,195 @@ class Vision(private val ctx: Context, private val prefs: SharedPreferences) {
 
     private fun base(): String = normalizeBase(prefs.getString(PREF_URL, "") ?: "")
 
+    // MESURE DU 11-13, v5, qui detruit l'hypothese « c'est le binding du processus ».
+    // La v5 ne pose AUCUNE liaison de processus (bindProcessToNetwork supprime, chaque
+    // GET de l'AP attache par Network.openConnection) : le telechargement depuis l'AP a
+    // reussi (100 %, 336336 octets) donc la methode est bonne, MAIS la requete de
+    // traduction part neanmoins par l'interface de l'AP :
+    //   failed to connect to /192.168.31.92 (port 8080) from /192.0.0.2 after 8000ms
+    // Cause mesuree, pas devinee : une seule station Wi-Fi. L'association a l'AP des
+    // lunettes DECONNECTE le Wi-Fi de la maison : pendant la traduction il n'existe plus
+    // AUCUNE route vers 192.168.31.92. Ce n'etait ni le serveur (mesure, AP relachee,
+    // depuis le telephone : curl http://192.168.31.92:8080/v1/models -> HTTP=200 en 21 ms,
+    // modele swift-1.5-iq3_s, input_modalities [text, image]) ni le binding : c'est
+    // l'absence de reseau maison.
+    // LA CONSISTANCE D'ORIGINE, ce que reproduit ce code : dans la version du
+    // constructeur ou le serveur repondait, le trafic IA partait par le Wi-Fi permanent,
+    // sans reseau ephemere. Ici la lecture de l'AP impose un reseau ephemere, donc il
+    // faut REDMANDER le reseau maison, et l'attacher connexion par connexion, comme
+    // WifiImport.apOpen l'a fait pour l'AP avec succes.
+    private val homeLock = Object()
+    @Volatile private var homeNet: Network? = null
+    @Volatile private var homeTried = false
+
+    /**
+     * Le reseau de la maison (Wi-Fi normal, capacite INTERNET, AUCUN specifier) :
+     * demande au systeme, qui rend le reseau auquel le telephone est relie. Demande
+     * non definitive : elle est relancee si le reseau a ete rendu depuis.
+     */
+    private fun homeNetwork(l: (String) -> Unit): Network? {
+        if (homeNet != null) return homeNet
+        synchronized(homeLock) {
+            if (homeNet != null) return homeNet
+            val cm = try { ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
+                catch (e: Exception) { return null }
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val got = java.util.concurrent.CountDownLatch(1)
+            var cb: ConnectivityManager.NetworkCallback? = null
+            try {
+                cb = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        homeNet = network
+                        got.countDown()
+                    }
+                    override fun onUnavailable() { got.countDown() }
+                }
+            } catch (e: Exception) { cb = null }
+            val c = cb ?: return null
+            // homeTried sert a journaliser une fois : la reussite ne s'affiche pas a
+            // chaque requete, l'echec si, puisqu'il est la cause de l'echec.
+            homeTried = true
+            try { cm.requestNetwork(req, c, 20000) } catch (e: Exception) {
+                l("reseau maison demande en vain : ${e.message}")
+                return null
+            }
+            got.await(22, java.util.concurrent.TimeUnit.SECONDS)
+            val n = homeNet
+            if (n == null) {
+                l("reseau maison indisponible sous 22 s : le Wi-Fi de la maison ne s'est pas " +
+                    "retabli apres l'AP des lunettes")
+                try { cm.unregisterNetworkCallback(c) } catch (_: Exception) {}
+                return null
+            }
+            l("reseau maison retabli (handle ${n.networkHandle}) ; connexion par la voie ordinaire")
+            return n
+        }
+    }
+
+    /**
+     * Connexion OpenAI-compatible, par la voie ORDINAIRE, apres avoir attendu que le
+     * reseau par defaut (la maison) se retablisse. PAS Network.openConnection : mesure
+     * du 11-13 19:52:17.897, la liaison est REFUSEE sur le reseau maison,
+     * 74 ms apres l'encodage, donc avant tout depart de requete :
+     *   traduction impossible : Binding socket to network 297 failed:
+     *   EPERM (Operation not permitted)
+     * Android n'autorise l'attachement explicite que pour les reseaux que l'app a
+     * demandee avec un specifier : c'est ce qui marche pour l'AP de la classe
+     * WifiImport, et ce qui est refuse ici. Le reseau maison est le reseau PAR DEFAUT :
+     * la voie ordinaire y va d'elle-meme, il suffit d'attendre qu'il soit la, ce que
+     * fait homeNetwork (la station Wi-Fi est une : l'AP la deconnecte, il faut son
+     * retablissement). La demande reste enregistree, donc la route est retenue.
+     *
+     * Ce que la mesure a aussi detruit, c'est l'idee d'une image trop grosse : le
+     * payload REEL de la chaine (3200x2400, 336336 octets -> 448448 caracteres base64,
+     * 448786 octets de JSON) a ete rejoue contre le serveur, depuis le PC, avec le meme
+     * corps : HTTP 200 en 13,7 s, prompt_tokens=373, completion_tokens=523, reponse de
+     * 742 caracteres. Les 120 s de readTimeout sont tres loin du compte : AUCUN
+     * reéchantillonnage n'est necessaire, je n'en ai pas mis.
+     */
+    private fun openAi(u: String, l: (String) -> Unit): HttpURLConnection {
+        homeNetwork(l)
+        awaitHomeRoute(u, l)
+        // La mesure du 11-14 23:23 tranche : le reseau maison existe (homeNetwork en a
+        // rendu un, « reseau maison retabli (handle 1510939217933) ») mais il n'est PAS
+        // la route par defaut : la connexion nue est sortie par l'AP,
+        //   failed to connect to /192.168.31.85 (port 8080) from /192.0.0.2.
+        // Attendre que la route par defaut bascule ne suffit donc pas. L'attachement
+        // explicite, lui, est licite ICI et le devient seulement maintenant : Android
+        // n'autorise Network.openConnection que pour les reseaux que L'APP a demandés, et
+        // homeNetwork() a fait cm.requestNetwork(req, c, 20000) sur celui-la sans le
+        // desenregistrer. C'est ce qui echouait en v5 (« Binding socket to network 297
+        // failed: EPERM », 11-13 19:52:17.897) : a l'epoque AUCUNE demande maison n'etait
+        // posee. C'est aussi ce qui reussit sur l'AP dans WifiImport.apOpen, par la meme
+        // methode. Repli journalise sur la voie ordinaire si le systeme refuse.
+        val n = homeNet
+        if (n != null) {
+            try {
+                val c = n.openConnection(URL(u)) as HttpURLConnection
+                l("connexion attachee au reseau demande (handle ${n.networkHandle})")
+                return c
+            } catch (e: Exception) {
+                l("openConnection sur le reseau demande refusee (${e.message}) : repli voie ordinaire")
+            }
+        }
+        return URL(u).openConnection() as HttpURLConnection
+    }
+
+    /**
+     * Portail de routage, REÉCRIT après la mesure du 11-14 23:22:54, qui a detruit le
+     * discriminant precedent. La version « la route par defaut doit porter la capacite
+     * NET_CAPABILITY_INTERNET » est fausse, mesuree :
+     *   route par defaut verifyee : 192.0.0.2 (Wi-Fi maison)
+     *   failed to connect to /192.168.31.85 (port 8080) from /192.0.0.2 (port 42690)
+     * L'AP des lunettes A LA CAPACITE INTERNET (le systeme la lui rend), donc ce test
+     * l'accepte comme « maison ». Le nom que je lui collais etait une etiquette, pas une
+     * mesure : la seule chose que la mesure etablisse est l'adresse de l'interface.
+     *
+     * Ce que la physique des mesures impose (3 echecs sur 3 mesurés, 22:20, 23:23, et le
+     * 11-13 19:52) : le telephone a UNE SEULE station Wi-Fi. L'association a l'AP des
+     * lunettes DECONNECTE le Wi-Fi de la maison. Donc, le temps de l'import, il n'existe
+     * AUCUN chemin vers le reseau 192.168.31.x : l'AP est isolee, sans passerelle. La
+     * maison doit d'ABORD se reconnecter, et la requete ne doit partir que lorsque la
+     * route par defaut est sur le SOUS-RESEAU DU SERVEUR, c'est-a-dire la/les reseaux
+     * dont une adresse de lien est dans le meme /24 que l'hote configure. Ce test est
+     * materiellement discriminant la ou capacite INTERNET ne l'etait pas, parce qu'il
+     * compare l'adresse de lien de l'interface (192.0.0.2 = AP, 192.168.31.x = maison) a
+     * celle du serveur, sans rien supposer sur les drapeaux du systeme.
+     *
+     * Repli honnete : si la maison ne revient pas dans le delai, on journalise l'adresse
+     * de sortie attendue et on tente quand meme, pour que le journal porte l'echec
+     * complet (et pas un abandon silencieux).
+     */
+    private fun awaitHomeRoute(u: String, l: (String) -> Unit) {
+        val cm = try { ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
+            catch (e: Exception) { l("portail de routage: service connectivite absent"); return }
+        val host = try { URL(u).host } catch (e: Exception) { "" }
+        val serverSub = host.substringBeforeLast('.', "")   // "http://192.168.31.85:8080" -> "192.168.31"
+        val v4 = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$")
+        fun subOf(a: String?): String? = a?.let { v4.find(it)?.value?.substringBeforeLast('.') }
+        val serverSubOk = serverSub.isNotEmpty() && v4.matches(host)
+        var last: String? = null
+        var i = 0
+        while (i < 60) {
+            val nets = try { cm.getAllNetworks().toList() } catch (e: Exception) { emptyList() }
+            val match = nets.firstOrNull { n ->
+                val caps = try { cm.getNetworkCapabilities(n) } catch (e: Exception) { null }
+                if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) false
+                else {
+                    val addrs = try { cm.getLinkProperties(n)?.linkAddresses?.map { it.address.hostAddress } ?: emptyList() }
+                        catch (e: Exception) { emptyList() }
+                    addrs.any { subOf(it) == serverSub }
+                }
+            }
+            val act = try { cm.activeNetwork } catch (e: Exception) { null }
+            last = try { act?.let { cm.getLinkProperties(it)?.linkAddresses?.firstOrNull()?.address?.hostAddress } } catch (e: Exception) { null } ?: last
+            if (match != null) {
+                val a = try { cm.getLinkProperties(match)?.linkAddresses?.firstOrNull()?.address?.hostAddress } catch (e: Exception) { null }
+                l("route retenue : " + (a ?: "interface sans adresse") + " sur le sous-reseau du serveur " +
+                    serverSub + ".x (handle ${match.networkHandle})")
+                return
+            }
+            Thread.sleep(500); i++
+        }
+        l("aucun Wi-Fi du sous-reseau du serveur " + serverSub + ".x apres 30 s : la maison ne s'est " +
+            "pas reconnectee depuis l'AP des lunettes. L'AP est isolee (les 3 echecs mesures " +
+            "sortent par 192.0.0.2, sans passerelle vers " + serverSub + ".x) ; la requete " +
+            "partira par " + (last ?: "aucune interface") + " et n'atteindra pas le serveur. " +
+            (if (serverSubOk) "" else "URL serveur non IPv4 : le controle de sous-reseau est inactif, " +
+                "entre l'IP de la maison en Reglages > Serveur IA.")
+        )
+    }
+
     /** sonde de configuration, pour le diagnostic affiche a l'ecran. */
     fun probe(l: (String) -> Unit) {
         val b = base()
         if (b.isEmpty()) { l("serveur IA non configure (Reglages > Serveur IA)"); return }
         l("sonde $b/health")
         try {
-            val c = URL(b + "/health").openConnection() as HttpURLConnection
+            val c = openAi(b + "/health", l)
             c.connectTimeout = 4000; c.readTimeout = 4000
             val code = c.responseCode
             val body = try {
@@ -144,7 +330,7 @@ class Vision(private val ctx: Context, private val prefs: SharedPreferences) {
         Thread {
             val out = ArrayList<String>()
             try {
-                val c = URL(b + "/v1/models").openConnection() as HttpURLConnection
+                val c = openAi(b + "/v1/models", { _ -> })
                 auth(c)
                 c.connectTimeout = 5000; c.readTimeout = 8000
                 if (c.responseCode == 200) {
@@ -210,7 +396,7 @@ class Vision(private val ctx: Context, private val prefs: SharedPreferences) {
         }.toString()
 
         return try {
-            val c = URL(b + "/v1/chat/completions").openConnection() as HttpURLConnection
+            val c = openAi(b + "/v1/chat/completions", l)
             c.requestMethod = "POST"
             c.doOutput = true
             auth(c)

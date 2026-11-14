@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Handler
@@ -50,9 +51,54 @@ class BleCtl(
     private var listener: Listener? = null
     var mtu: Int = 23; private set
 
+    /** Appareil de la liaison en cours, garde pour la query systeme (voir isLinked). */
+    private var peer: BluetoothDevice? = null
+
     fun setListener(l: Listener?) { listener = l }
 
-    private fun emit(s: State, d: String = "") = handler.post { listener?.onState(s, d) }
+    private fun emit(s: State, d: String = "") {
+        lastState = s
+        handler.post { listener?.onState(s, d) }
+    }
+
+    @Volatile var lastState: State = State.IDLE; private set
+
+    /**
+     * La liaison est-elle ETABLIE LA, maintenant, et par quoi on le sait. Etat
+     * faisant autorite, et non une deduction par evenements. Le second element du
+     * pair est la source de la reponse : « query systeme » quand la query a
+     * repondu, « repli » quand elle a leve (absence du service, permission
+     * refusee) — la valeur rendue par un repli doit se lire a l'ecran, pas se
+     * deviner.
+     *
+     * Pourquoi ce modele est indispensable : les evenements onConnectionStateChange
+     * ne partent qu'au CHANGEMENT d'etat. Un listener ajoute apres la connexion
+     * (le notre, dans Translate, cree au premier clic) ne recoit donc JAMAIS
+     * CONNECTED, et un drapeau initialise a partir de ces evenements reste false
+     * pour toujours. Defaut mesure 2026-11-13 : le bouton « Traduire le texte »
+     * sortait sur « lunettes deconnectees : rien a declencher » alors que dumpsys
+     * bluetooth_manager affichait ConnectionState: STATE_CONNECTED sur E09-3AA1.
+     *
+     * BluetoothManager.getConnectionState(device, BluetoothProfile.GATT) lit l'etat
+     * que le systeme tient pour NOTRE liaison GATT (dumpsys en rend trace : la ligne
+     * « 7: C2:01:06:00:3A:A1 appId=7 », profil 7 = GATT).
+     */
+    fun linkState(): Pair<Boolean, String> {
+        val d = peer
+        if (d == null)
+            return (lastState == State.CONNECTED) to "repli: pas d'appareil connu pour cette instance"
+        val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        if (mgr == null)
+            return (lastState == State.CONNECTED) to "repli: service BLUETOOTH_SERVICE absent"
+        val linked = try {
+            mgr.getConnectionState(d, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+        } catch (t: Throwable) {
+            return (lastState == State.CONNECTED) to "repli: query levee (${t.javaClass.simpleName})"
+        }
+        return linked to "query systeme (profil GATT)"
+    }
+
+    fun isLinked(): Boolean = linkState().first
 
     private val cb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -104,6 +150,7 @@ class BleCtl(
 
     fun connect(dev: BluetoothDevice) {
         disconnect()
+        peer = dev
         emit(State.CONNECTING, dev.address)
         gatt = dev.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
     }
@@ -111,8 +158,10 @@ class BleCtl(
     fun disconnect() {
         gatt?.let { it.close(); }
         gatt = null
+        peer = null
         writing = false
         queue.clear()
+        lastState = State.DISCONNECTED
     }
 
     /** Envoie une trame ; mise en file si une ecriture est en cours. */
@@ -128,6 +177,35 @@ class BleCtl(
     }
 
     fun sendRaw(bytes: ByteArray) { queue.add(bytes); drain() }
+
+    /**
+     * Donne le NOM de la constante Android correspondant au statut rendu par
+     * writeCharacteristic. Le journal ne disait que « GATT=201 », ce qui ne permet
+     * pas de separer un conflit de liaison d'une file d'appels saturee. Les constantes
+     * de BluetoothGatt sont publiques et statiques : on les lit par reflection et on
+     * cherche celle qui vaut la valeur observee. Mesure, pas supposition.
+     */
+    private fun nameOfGatt(v: Int): String {
+        return try {
+            val hits = BluetoothGatt::class.java.fields
+                .filter { it.type == Int::class.java && it.get(null) == v }
+                .joinToString("|") { it.name }
+            // BluetoothGatt ne couvre que les statuts ATT/GATT (0x00-0xFF, 0x0101) : la
+            // mesure du 11-14 23:22 rend « hits vide » pour 201, donc la valeur vient de
+            // l'autre namespace, BluetoothStatusCodes (statuts rendus par la pile
+            // Bluetooth du telephone, dont writeCharacteristic se sert aussi). Reflexion
+            // par nom de classe : BluetoothStatusCodes est @hide, elle peut etre refusee,
+            // d'ou le try.
+            val stack = try {
+                Class.forName("android.bluetooth.BluetoothStatusCodes").fields
+                    .filter { it.type == Int::class.java && it.get(null) == v }
+                    .joinToString("|") { it.name }
+            } catch (e: Exception) { "BluetoothStatusCodes inaccessible (${e.javaClass.simpleName})" }
+            if (hits.isNotEmpty()) return hits
+            if (stack.isNotEmpty()) return "stack: $stack"
+            "constante inconnue dans BluetoothGatt et BluetoothStatusCodes"
+        } catch (e: Exception) { "reflection indisponible: ${e.javaClass.simpleName}" }
+    }
 
     /** Pareille a BleCore : 1 ecriture a la fois, retry 100 ms, max 5 essais. */
     private fun drain() {
@@ -150,7 +228,7 @@ class BleCtl(
         } else if (ok != BluetoothGatt.GATT_SUCCESS) {
             retries = 0
             writing = false
-            emit(State.ERROR, "writeCharacteristic GATT=$ok, trame jetee")
+            emit(State.ERROR, "writeCharacteristic GATT=$ok (" + nameOfGatt(ok) + "), trame jetee")
         }
     }
 }

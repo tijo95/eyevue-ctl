@@ -39,7 +39,10 @@ import java.util.concurrent.atomic.AtomicReference
  *      SSID du scan, pas celui du BLE.
  *   3. requestNetwork + WifiNetworkSpecifier (la voie utilisee par l'app
  *      constructeur, verifiee dans les logs: "WifiMatcher: match: SSID LITERAL"),
- *      puis bindProcessToNetwork. WPA2-PSK; cle = la constante relevee dans
+ *      PUIS, ici, Network.openConnection sur ce reseau pour chaque GET (apOpen) : le
+ *      processus n'est jamais lie, donc la requete IA reste sur le Wi-Fi permanent.
+ *      (bindProcessToNetwork est la voie du constructeur : elle a echoue ici, mesuree,
+ *      voir release().) WPA2-PSK; cle = la constante relevee dans
  *      ModBleResponse, transmise a onWifiData(ssid, cle), jamais recue par BLE.
  *   4. sonde AP_HOST:80, 6 tentatives (log constructeur "probe ... 1/6, 27 ms").
  *   5. GET sequentiels avec Range (reprise Content-Range), Connection: close,
@@ -67,6 +70,10 @@ class WifiImport(
     private var connThread: Thread? = null
     private var httpConn: HttpURLConnection? = null
     private var pendingCb: ConnectivityManager.NetworkCallback? = null
+    // Le reseau de l'AP, attache a CHAQUE connexion HTTP par Network.openConnection
+    // (voir apOpen). Le processus n'est jamais lie, donc le trafic IA reste sur le
+    // Wi-Fi permanent.
+    private var apNetwork: Network? = null
     private var scanReceiver: BroadcastReceiver? = null
     private val main = Handler(Looper.getMainLooper())
 
@@ -232,8 +239,16 @@ class WifiImport(
 
         // 0x25 (SSID) n'arrive que ~2,5 s apres 0x39 sur notre paire (log
         // 00:59:54.628 -> 00:59:57.107) : on lui laisse 8 s. Connu, il dispense
-        // du scan systeme, qui est bride pour une app ciblee 33 sans
-        // ACCESS_FINE_LOCATION (le scan ne remonte rien : "aucun SSID DH-*").
+        // du scan systeme.
+        // MESURE DU 11-13, qui corrige ce qui etait attribue au bridage Android : le
+        // scan de l'app etait muet (« startScan=false, 0 resultats, SSID vus: ») ET le
+        // scan SYSTEME, lance hors de l'app (cmd wifi start-scan, puis
+        // list-scan-results), ne rendait aucun reseau DH-* non plus : 8 reseaux vus
+        // (Livebox-95E0, Xiaomi_wifi7, Mbaye Family…), aucun des lunettes, alors que
+        // NEARBY_WIFI_DEVICES etait granted=true. La cause n'etait donc pas le bridage
+        // du scan : c'est que L'AP N'EMETTAIT PAS, faute de 0x39 (voir Translate.runChain,
+        // openWifiAp n'etait appele que par AlbumActivity). Le scan reste un secours ;
+        // 0x39 est la commande qui cree le reseau que le scan cherche.
         var want: String? = bleSsid?.trim()?.takeIf { it.isNotEmpty() }
         var waited = 0
         while (want == null && !cancelled && waited < 16) {
@@ -267,7 +282,11 @@ class WifiImport(
             val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     connected = true
-                    try { cm.bindProcessToNetwork(network) } catch (_: Exception) {}
+                    // PAS bindProcessToNetwork : on garde le reseau et on l'attache
+                    // connexion par connexion (apOpen). Lier le processus est ce qui
+                    // envoyait la requete de traduction par 192.0.0.2.
+                    apNetwork = network
+                    main.post { listener.onLog("reseau AP attache connexion par connexion (handle " + network.networkHandle + ") ; processus non lie") }
                     got.countDown()
                 }
                 override fun onUnavailable() { got.countDown() }
@@ -470,7 +489,7 @@ class WifiImport(
     private fun httpGet(urls: List<String>): String? {
         for (u in urls) {
             val body = try {
-                val c = URL(u).openConnection() as HttpURLConnection
+                val c = apOpen(u)
                 httpConn = c
                 c.connectTimeout = 5000
                 c.readTimeout = 20000
@@ -497,7 +516,7 @@ class WifiImport(
     @Deprecated("remplace par httpGet")
     private fun fetchListOld(): List<MediaFile>? {
         val body = try {
-            val c = URL("http://" + AP_HOST + "/").openConnection() as HttpURLConnection
+            val c = apOpen("http://" + AP_HOST + "/")
             httpConn = c
             c.connectTimeout = 5000
             c.readTimeout = 10000
@@ -619,7 +638,7 @@ class WifiImport(
 
     /** Code HTTP d'un GET, journalise par l'appelant. Ne leve pas sur 4xx/5xx. */
     private fun httpCode(u: String): Int = try {
-        val c = URL(u).openConnection() as HttpURLConnection
+        val c = apOpen(u)
         httpConn = c
         c.connectTimeout = 5000
         c.readTimeout = 15000
@@ -646,7 +665,7 @@ class WifiImport(
         val tmp = File(ctx.cacheDir, f.name)
         var start = if (tmp.exists()) tmp.length() else 0L
         return try {
-            val conn = URL(url).openConnection() as HttpURLConnection
+            val conn = apOpen(url)
             httpConn = conn
             conn.connectTimeout = 5000
             conn.readTimeout = 15000
@@ -747,7 +766,50 @@ class WifiImport(
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         pendingCb?.let { try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {} }
         pendingCb = null
+        // PAS DE LIAISON DE PROCESSUS, et c'est le point de cette version.
+        // Les deux voies testees sont mesurees :
+        //  - bindProcessToNetwork(reseau de l'AP) : la traduction partait par
+        //    l'interface du reseau ephemere ->
+        //      failed to connect to /192.168.31.92 (port 8080) from /192.0.0.2 after 8000ms
+        //  - bindProcessToNetwork(null) « pour rendre le reseau » : le log affichait
+        //    « AP relachee » et la requete partait NEANMOINS par /192.0.0.2. Le systeme
+        //    detruit le reseau ephemere en asynchrone ; null laisse le choix au systeme,
+        //    qui prend l'interface encore vivante.
+        // La voie retenu est apOpen() : chaque connexion HTTP est attachee AU reseau de
+        // l'AP par Network.openConnection, le processus n'est jamais lie. Le trafic IA
+        // reste donc sur le Wi-Fi permanent, SANS course de liberation et SANS binding a
+        // annuler. C'est la condition de la version d'origine, celle ou le serveur
+        // repondait : l'origine ne liait jamais le processus (son AiConfig ecrivait
+        // l'authority du serveur, le traffic partait par le Wi-Fi permanent).
+        // MESURE qui confirme que le serveur n'etait pas en cause, AP relachee, depuis le
+        // telephone : curl http://192.168.31.92:8080/v1/models -> HTTP=200 en 21 ms, modele
+        // swift-1.5-iq3_s, input_modalities [text, image] ; POST /v1/chat/completions corps
+        // vide -> HTTP=400, la reponse attendue.
+        apNetwork = null
+        // Garde : si une version anterieure a lie le processus, on s'assure qu'il ne
+        // reste pas lie. Aucun binding n'est pose ailleurs dans ce fichier desormais.
         try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+    }
+
+    /**
+     * Connexion HTTP sur LE reseau de l'AP, sans liaison de processus.
+     *
+     * Network.openConnection(URL) (API 23, publique) attache CETTE connexion a ce reseau
+     * precis : le listing et le telechargement sortent par l'AP, et rien d'autre, dans le
+     * fichier, n'utilise ce chemin. Le processus n'etant jamais lie, la requete de
+     * traduction part par le Wi-Fi normal.
+     *
+     * Repli openConnection standard quand le reseau n'est pas la (chemin d'import sans
+     * requestNetwork, ou reseau deja rendu) : ces requetes ne visent que l'AP, donc le
+     * repli ne peut pas envoyer de trafic IA par l'AP.
+     */
+    private fun apOpen(u: String): HttpURLConnection = try {
+        val n = apNetwork
+        if (n != null) n.openConnection(URL(u)) as HttpURLConnection
+        else URL(u).openConnection() as HttpURLConnection
+    } catch (e: Exception) {
+        main.post { listener.onLog("apOpen repli sans reseau AP (" + (if (apNetwork == null) "aucun reseau attache" else "reseau AP attache, " + e.message) + ") : $u") }
+        URL(u).openConnection() as HttpURLConnection
     }
 
     /** Repli 1 geste quand la cle pre-remplie est refusee (1 geste = le panneau). */
@@ -813,12 +875,14 @@ class WifiImport(
                 "la vignette BLE (720x300) ne rend pas du texte lisible, la traduction " +
                 "est impossible par ce chemin")
         listener.onLog("AP « $ssid » associee")
-        // release() est OBLIGATOIRE en finally : acquireAp() a appele
-        // bindProcessToNetwork(network). Tant que ce lien tient, TOUT le trafic
-        // HTTP de l'app sort par l'AP des lunettes, qui ne donne pas acces au
-        // reseau local. Le serveur IA est sur le reseau local : sans release(),
-        // la requete de traduction part dans l'AP et echoue, avec un message
-        // d'erreur qui ne dit rien de la vraie cause.
+        // release() est OBLIGATOIRE en finally : il rend la demande reseau et vide
+        // apNetwork. La raison a change, la mesure la dit : avec la liaison de processus
+        // du constructeur, la requete de traduction partait par l'interface du reseau
+        // ephemere (from /192.0.0.2) et echouait. Desormais aucune liaison n'est pose,
+        // donc le trafic IA est sur le Wi-Fi permanent DES LE DEBUT ; release() sert a
+        // rendre l'AP (demande systeme + association gardees) et a ne rien laisser
+        // attache. Il sert aussi a ne pas laisser de binding pose par une version
+        // anterieure installee sur le meme telephone.
         try {
             val files = fetchList() ?: return Snap.Err(
                 "listing de l'AP indisponible : aucune des 2 bases n'a repondu " +
@@ -828,8 +892,20 @@ class WifiImport(
 
             // Fraiches = parties APRÈS le declenchement. C'est ce filtre qui
             // ecarte les photos deja presentes, et il ne fonctionne que si
-            // l'epoch du listing est comparable a l'heure du telephone : c'est
-            // pour cela que l'app envoie TIME (0x16) a la connexion (Fabrice).
+            // l'epoch du listing est comparable a l'heure du telephone. TIME est
+            // 0x59 (0x16 est GET_CAPACITY : les deux lignes qui parlaient de « TIME
+            // (0x16) » sont fautes, corrigees ici). Le declenchement envoie desormais
+            // 0x59 avant de noter son heure, voir Translate.runChain.
+            // La comparaison tient, mesure sur le seul corps de listing journalise
+            // (11-12 14:07:05) : createtimestr "20261111233442" = 1 794 436 482,
+            // l'heure du telephone a ce moment-la ~1 794 436 000 : MEME ORDRE DE
+            // GRANDEUR. Le nom de fichier porte la meme date (EVENT/20261111233442737),
+            // et epochFromName() la relit depuis les 14 premiers chiffres.
+            // Ce qui N'EST PAS mesure : que la NOUVELLE photo (declenchee par 0x22) se
+            // retrouve dans le listing, et avec quelle date. Le 11-13, le declenchement
+            // n'a rien produit (compteur 0x42 reste a 5, 15 s) ; ce filtre n'a donc
+            // jamais ete teste sur une photo fraiche, et 0x59 n'etait alors jamais
+            // envoye (compte logcat : 0 trame 0x59).
             val fresh = files.filter { it.epochSec != null && it.epochSec >= trigger }
             val pool = if (fresh.isNotEmpty()) fresh
             // Repli honnete : si AUCUN fichier n'est marque posterieur, le
@@ -842,7 +918,7 @@ class WifiImport(
                 .sortedBy { it.epochSec }.takeLast(3)
                 .also { listener.onLog("aucun fichier marque posterieur au declenchement : " +
                     "l'epoch du listing est sans doute cale sur une autre horloge que " +
-                    "celle du telephone (0x16) ; repli sur les 3 plus recentes") }
+                    "celle du telephone (TIME est 0x59) ; repli sur les 3 plus recentes") }
 
             val newest = pool.filter { it.tab == MediaFile.TAB_PHOTO }
                 .maxByOrNull { it.epochSec!! }
@@ -878,7 +954,7 @@ class WifiImport(
             }
         } finally {
             release()
-            listener.onLog("AP relachee (bindProcessToNetwork annule) : acces reseau local rendu")
+            listener.onLog("AP relachee ; reseau nomme pour la suite (voir release)")
         }
     }
 }
