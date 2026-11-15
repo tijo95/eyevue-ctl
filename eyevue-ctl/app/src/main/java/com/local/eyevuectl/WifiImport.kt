@@ -471,8 +471,33 @@ class WifiImport(
             "http://$AP_HOST/"
         )) ?: return null
         val list = MediaFile.parseFileList(body)
-        if (list.isEmpty()) dumpListing(body)
+        // Le corps est journalise SYSTEMATIQUEMENT, pas seulement quand la liste est
+        // vide. Defaut MESURE : l'ancien conditionnel « if (list.isEmpty()) » n'a
+        // jamais brule, puisque le listing du 11-15 rend 8 entrees PARSEES. Le corps
+        // brut de ces 8 entrees n'a donc JAMAIS ete journalise, et c'est exactement la
+        // donnee qui manque pour dire pourquoi aucune n'est retene comme IMAGE : le
+        // filtre de selection est tab == TAB_PHOTO, et tab vient de l'extension
+        // (AlbumData.kt:28-33 : jpg/jpeg/png -> PHOTO, aac/wav/mp3 -> REC,
+        // mp4/3gp/mov/avi -> VIDEO, SINON TAB_ALL). Sans le corps, on ne sait pas
+        // quelle extension porte reellement ce que l'AP rend.
+        dumpListing(body)
+        dumpParsed(list)
         return list
+    }
+
+    /** Ce que le PARSEUR rend de chaque entree : c'est ce que le filtre voit.
+     *  Journaliser les champs rend un defaut de filtre separable d'un defaut de parsing. */
+    private fun dumpParsed(list: List<MediaFile>) {
+        val TAB = MediaFile.TAB_LABELS
+        main.post {
+            listener.onLog("listing parse : ${list.size} entree(s) -> " +
+                list.joinToString(" ; ") { f ->
+                    "ext='${f.ext}' tab=${TAB.getOrElse(f.tab) { f.tab.toString() }}" +
+                        " epoch=${f.epochSec} size=${f.size} nom='${f.name}'"
+                })
+        }
+        for (f in list) Log.i(TAG, "entree ext=${f.ext} tab=${f.tab} epoch=${f.epochSec} " +
+            "size=${f.size} path=${f.path}")
     }
 
     /**
@@ -544,8 +569,8 @@ class WifiImport(
     private fun dumpListing(body: String) {
         val bytes = body.toByteArray(Charsets.UTF_8)
         val hex = bytes.take(96).joinToString(" ") { "%02x".format(it) }
-        val text = body.take(600).replace("\r", " ").replace("\n", " ")
-        main.post { listener.onLog("listing sans <File> : hex[$hex] texte[$text]") }
+        val text = body.take(900).replace("\r", " ").replace("\n", " ")
+        main.post { listener.onLog("listing BRUT (${bytes.size} o) : hex[$hex] texte[$text]") }
         Log.w(TAG, "listing brut (${bytes.size} o): $text")
     }
 
