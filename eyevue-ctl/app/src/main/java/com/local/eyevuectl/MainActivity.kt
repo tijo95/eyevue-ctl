@@ -86,6 +86,9 @@ class MainActivity : Activity() {
     private var videoOn = false
     private var micOn = false
 
+    /** Sonde SPP (R4) : écoutee sur RFCOMM, aucune émission de notre part. */
+    private var sppProbe: SppProbe? = null
+
     /** Les lunettes ont ete vues avec ce nom / ce prefixe MAC : connexion directe. */
     private val preferredName = "E09"
     private val preferredMacPrefix = "C2:01:06"
@@ -108,6 +111,8 @@ class MainActivity : Activity() {
         // shutdown() ferme le proxy A2DP et le service TTS : sans lui le telephone
         // garde une prise A2DP ouverte, ce qui gene l'audio des autres apps.
         tts?.shutdown()
+        sppProbe?.close()      // la sonde SPP tient un socket RFCOMM : le rendre a la pile
+        sppProbe = null
         super.onDestroy()
     }
 
@@ -441,6 +446,44 @@ class MainActivity : Activity() {
         vl.topMargin = dp(10f)
         vol.layoutParams = vl
         box.addView(vol)
+
+        // --- carte SONDE SPP (R4). Le pilotage de la LENTILLE se fait sur le canal
+        //     SPP/RFCOMM (PROTOCOL.md:13 : gros volume, photos, audio, vidéo), avec les
+        //     opcodes 0x97/0x98/0x99 que nous n'avons JAMAIS captures en BLE. La capture
+        //     HCI systeme est fermée ici : « adb shell su -c id » rend « su: inaccessible
+        //     ou ne trouve », donc pas de btsnoop. RFCOMM etant multiclent, notre propre
+        //     socket suffit pour ECOUTER. La carte est un bouton poussoir : ecoute /
+        //     arrét, et le journal rend les trames, le compteur d'octets et le compteur
+        //     d'octets indecodables, pour separer « rien ne passe » de « ca passe, ce
+        //     n'est pas trame ».
+        val spp = actionCard("Ecouter le canal SPP (lentille)", "\ud83d\udce1", 1f) {
+            val running = sppProbe
+            if (running != null) { running.close(); sppProbe = null; log("SPP : sonde arretee"); return@actionCard }
+            val a = adapter ?: run { log("SPP : aucun adaptateur Bluetooth"); return@actionCard }
+            val d = ble.peerDevice() ?: run {
+                log("SPP : aucun appareil connu : établir d'abord la liaison BLE, la sonde " +
+                    "cible le MEME appareil que celui que nous pilotons"); return@actionCard
+            }
+            var justStarted: SppProbe? = null
+            val fresh = SppProbe(a, d, { s -> log(s) }, {
+                // Fin d'ecoute constatee par le fil : le champ est remis a null, sinon le
+                // bouton ne peut plus relancer (defaut mesure du 11-15 14:01 : le tap de
+                // 14:01 rendait « sonde arretee » au lieu d'ouvrir, la sonde n'avait RIEN
+                // ecoute et la mesure visée — ecouter pendant un flux video — n'a pas eu lieu).
+                main.post {
+                    if (sppProbe === justStarted) sppProbe = null
+                    log("SPP : ecoute terminee, le bouton peut relancer")
+                }
+            })
+            justStarted = fresh
+            sppProbe = fresh
+            fresh.start()
+        }
+        val sl = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        sl.topMargin = dp(10f)
+        spp.layoutParams = sl
+        box.addView(spp)
 
         // --- reste du protocole, depliable
         val more = txt(14f, 0xFF9A9AA0.toInt())

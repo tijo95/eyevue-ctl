@@ -159,6 +159,10 @@ class BleCtl(
     private var cccdSettled = false
     private var cccdDeadline = 0L
 
+    /** L'appareil de la liaison, rendu public pour la sonde SPP (R4) : elle doit ouvrir
+     *  son propre socket RFCOMM sur le MEMEappareil que celui que nous pilotons en BLE. */
+    fun peerDevice(): BluetoothDevice? = peer
+
     fun setListener(l: Listener?) { listener = l }
 
     private fun emit(s: State, d: String = "") {
