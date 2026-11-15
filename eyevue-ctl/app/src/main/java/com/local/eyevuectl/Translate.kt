@@ -164,6 +164,12 @@ class Translate(
             (if (bleEventConnected) "CONNECTED" else "aucune"))
         if (!linked) return "lunettes déconnectées : rien à déclencher"
 
+        // Liaison occupee par une AUTRE app : c'est la cause mesuree des echecs du 11-14
+        // 22:46 (deux clients GATT sur C2:01:06:00:3A:A1 -> rejets 201 -> 0x39 perdu ->
+        // AP eteinte -> 20 cycles de scan a vide). Elle est detectable : le systeme rend
+        // l'appareil CONNECTE pour n'importe quel client, pas pour le notre.
+        shared.ble.foreignLinkHint()?.let { log("AVERTISSEMENT : $it") }
+
         // L'horloge des lunettes estcalee sur celle du telephone AVANT de noter
         // l'heure du declenchement. Le filtre du listing (epochSec >= heure du
         // telephone) ne vaut que si les deux horloges sont comparables, et 0x59
@@ -192,8 +198,22 @@ class Translate(
         // --- etape 1 : declencher en HAUTE QUALITE. Le defaut de takePhoto est
         // la vignette (0x30) ; la vignette est inutilisable pour du texte.
         val triggerSec = Calendar.getInstance().timeInMillis / 1000L
+        val dropBefore = shared.ble.droppedFrames
         shared.eyevue.takePhoto(true)
         log("prise de vue declenchee (0x22 / 0x31, payload HauteQualite)")
+
+        // La commande de declenchement est une commande de CONTROLE : si sa premiere
+        // ecriture est rejetee, le backoff de BleCtl la re-emet en fin de file. On le
+        // constate par le compteur de trames, et on relance 0x22 si necessaire, pour que
+        // le declenchement ait bien ete recu par les lunettes (le bruit que l'utilisateur
+        // entend en est la preuve physique, et le log le dit en chiffres).
+        Thread.sleep(1_500)
+        if (shared.ble.droppedFrames > dropBefore) {
+            log((shared.ble.droppedFrames - dropBefore).toString() +
+                " trame(s) jetee(s) pendant le declenchement : relance de 0x22 (0x31) pour " +
+                "que la prise de vue soit garantie recue")
+            shared.eyevue.takePhoto(true)
+        }
 
         // --- etape 2 bis : attendre que le fichier existe. Bornee par un fait :
         // le compteur remonte, OU 0x44 (telechargement termine) parait. 0x44 n'est
@@ -240,9 +260,21 @@ class Translate(
         // le scan SYSTEME lui-meme (cmd wifi start-scan, hors de l'app) ne rend
         // aucun reseau DH-* : 8 reseaux vus, aucun des lunettes. L'AP etait eteinte.
         // Meme sequence que l'Album : 0x39 d'abord, la suite Wi-Fi ensuite.
+        val dropBeforeAp = shared.ble.droppedFrames
         shared.eyevue.openWifiAp()
         log("ouverture de l'AP demandee aux lunettes (0x39 payload [01], le seul " +
             "payload observe sur cette paire)")
+        // 0x39 est LA commande qui allume l'AP : si sa premiere ecriture est rejetee, le
+        // backoff la re-emet, mais la re-emission part en fin de file, c'est-a-dire apres
+        // les commandes suivantes. L'AP etant la seule source de la pleine resolution, on
+        // la redemande ici, immediatement, des que le compteur de trames signale une perte
+        // (mesure du 11-14 22:47 : 0x39 perdu -> « scan startScan=false, 0 resultats »).
+        Thread.sleep(1_500)
+        if (shared.ble.droppedFrames > dropBeforeAp) {
+            log((shared.ble.droppedFrames - dropBeforeAp).toString() +
+                " trame(s) jetee(s) pendant l'ouverture AP : relanceImmediate de 0x39")
+            shared.eyevue.openWifiAp()
+        }
 
         val latch = CountDownLatch(1)
         var snap: WifiImport.Snap? = null
